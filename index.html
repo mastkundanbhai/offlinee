@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#0f172a" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <title>Complete Offline Pocket AI</title>
+  <!-- ONNX Runtime & Silero VAD -->
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.19/dist/bundle.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --surface: #1e293b;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --accent: #3b82f6;
+      --standby: #6366f1;
+      --awake: #10b981;
+      --user-msg: #2563eb;
+      --bot-msg: #334155;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      height: 100dvh;
+      overflow: hidden;
+    }
+    header {
+      background: var(--surface);
+      padding: 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      border-bottom: 1px solid #334155;
+    }
+    .header-top { display: flex; justify-content: space-between; align-items: center; }
+    .status-badge {
+      font-size: 0.75rem;
+      padding: 4px 10px;
+      border-radius: 9999px;
+      background: #334155;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .status-badge.standby { background: #312e81; color: #c7d2fe; }
+    .status-badge.awake { background: #065f46; color: #6ee7b7; }
+    .status-badge.error { background: #7f1d1d; color: #fca5a5; }
+    .controls { display: flex; gap: 8px; }
+    select, button {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid #475569;
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 0.85rem;
+    }
+    select { flex: 1; }
+    button { background: var(--accent); border: none; font-weight: 600; cursor: pointer; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    #wake-toggle-btn { background: #475569; min-width: 145px; transition: all 0.2s ease; }
+    #wake-toggle-btn.standby { background: var(--standby); color: #fff; }
+    #wake-toggle-btn.awake { background: var(--awake); color: #052e16; animation: pulse 1s infinite; }
+    @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.03); } }
+    #chat-container {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .message {
+      max-width: 85%;
+      padding: 10px 14px;
+      border-radius: 14px;
+      line-height: 1.45;
+      font-size: 0.95rem;
+      word-wrap: break-word;
+      white-space: pre-wrap;
+    }
+    .message.user { background: var(--user-msg); align-self: flex-end; border-bottom-right-radius: 4px; }
+    .message.assistant { background: var(--bot-msg); align-self: flex-start; border-bottom-left-radius: 4px; }
+    .message.system { align-self: center; color: var(--muted); font-size: 0.8rem; text-align: center; }
+    footer {
+      background: var(--surface);
+      padding: 12px;
+      display: flex;
+      gap: 8px;
+      border-top: 1px solid #334155;
+    }
+    input[type="text"] {
+      flex: 1;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid #475569;
+      padding: 12px;
+      border-radius: 10px;
+      font-size: 1rem;
+      outline: none;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="header-top">
+      <strong>Complete Offline AI</strong>
+      <span id="status" class="status-badge">Idle</span>
+    </div>
+    <div class="controls">
+      <select id="wakeword-select">
+        <option value="marvin" selected>Wake: "Marvin"</option>
+        <option value="sheila">Wake: "Sheila"</option>
+      </select>
+      <select id="model-select">
+        <option value="SmolLM2-360M-Instruct-q4f16_1-MLC">SmolLM2 360M</option>
+        <option value="Llama-3.2-1B-Instruct-q4f16_1-MLC" selected>Llama 3.2 1B</option>
+      </select>
+      <button id="load-btn">Init Stack</button>
+    </div>
+  </header>
+
+  <main id="chat-container">
+    <div class="message system">
+      Tap "Init Stack" to load models. Arm the wake guard to say "Marvin" hands-free or test tools (e.g. "Check my battery").
+    </div>
+  </main>
+
+  <footer>
+    <button id="wake-toggle-btn" disabled>Wake Guard: OFF</button>
+    <input type="text" id="user-input" placeholder="Type or ask..." disabled />
+    <button id="send-btn" disabled>Send</button>
+  </footer>
+
+  <script type="module">
+    import { CreateMLCEngine } from "https://esm.run/@mlc-ai/web-llm";
+    import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3";
+
+    env.allowLocalModels = false;
+    env.useBrowserCache = true;
+
+    const statusEl = document.getElementById("status");
+    const wakewordSelect = document.getElementById("wakeword-select");
+    const modelSelect = document.getElementById("model-select");
+    const loadBtn = document.getElementById("load-btn");
+    const chatContainer = document.getElementById("chat-container");
+    const wakeToggleBtn = document.getElementById("wake-toggle-btn");
+    const userInput = document.getElementById("user-input");
+    const sendBtn = document.getElementById("send-btn");
+
+    let pipelineState = "OFF";
+    let kwsClassifier = null;
+    let sttPipeline = null;
+    let llmEngine = null;
+    let myvad = null;
+    let commandTimeoutId = null;
+    let localVoice = null;
+    let activeTorchTrack = null;
+
+    const conversationHistory = [
+      { 
+        role: "system", 
+        content: `You are an offline voice assistant with local tool access. You can check battery via get_battery_status(), toggle flashlight via toggle_flashlight(state:"on"/"off"), or set alarms via set_offline_alarm(seconds:N). When a tool is needed, output JSON: {"tool": "name", "arguments": {}}. Otherwise reply in 1-2 spoken sentences.` 
+      }
+    ];
+
+    function initTTS() {
+      if (!("speechSynthesis" in window)) return;
+      const pick = () => {
+        const voices = window.speechSynthesis.getVoices();
+        localVoice = voices.find(v => v.localService && v.lang.startsWith("en")) || voices[0] || null;
+      };
+      pick();
+      window.speechSynthesis.onvoiceschanged = pick;
+    }
+    initTTS();
+
+    function speak(text) {
+      const clean = text.trim();
+      if (!clean || !("speechSynthesis" in window)) return;
+      const u = new SpeechSynthesisUtterance(clean);
+      if (localVoice) u.voice = localVoice;
+      u.rate = 1.05;
+      window.speechSynthesis.speak(u);
+    }
+
+    function playChime(freq = 880, duration = 140) {
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.frequency.setValueAtTime(freq, ctx.currentTime);
+        gain.gain.setValueAtTime(0.2, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration / 1000);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + duration / 1000);
+        setTimeout(() => ctx.close(), duration + 50);
+      } catch (_) {}
+    }
+
+    function appendMessage(role, text) {
+      const div = document.createElement("div");
+      div.className = `message ${role}`;
+      div.textContent = text;
+      chatContainer.appendChild(div);
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+      return div;
+    }
+
+    function setUI(state, label = "") {
+      pipelineState = state;
+      wakeToggleBtn.classList.remove("standby", "awake");
+      if (state === "OFF") {
+        wakeToggleBtn.textContent = "Wake Guard: OFF";
+        statusEl.textContent = label || "Paused";
+        statusEl.className = "status-badge";
+      } else if (state === "STANDBY") {
+        wakeToggleBtn.classList.add("standby");
+        wakeToggleBtn.textContent = `Say "${wakewordSelect.value}"`;
+        statusEl.textContent = label || "Low-Power Standby";
+        statusEl.className = "status-badge standby";
+      } else if (state === "AWAKE_LISTENING") {
+        wakeToggleBtn.classList.add("awake");
+        wakeToggleBtn.textContent = "Listening Command...";
+        statusEl.textContent = label || "Awake — Speak Now";
+        statusEl.className = "status-badge awake";
+      } else if (state === "PROCESSING") {
+        wakeToggleBtn.classList.add("awake");
+        wakeToggleBtn.textContent = "Processing...";
+        statusEl.textContent = label || "Thinking / Executing...";
+        statusEl.className = "status-badge awake";
+      }
+    }
+
+    async function executeTool(name, args) {
+      try {
+        if (name === "get_battery_status") {
+          if (!navigator.getBattery) return JSON.stringify({ error: "Not supported" });
+          const b = await navigator.getBattery();
+          return JSON.stringify({ level: `${Math.round(b.level * 100)}%`, charging: b.charging });
+        } else if (name === "toggle_flashlight") {
+          const on = args.state === "on";
+          if (on) {
+            if (!activeTorchTrack) {
+              const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+              activeTorchTrack = stream.getVideoTracks()[0];
+            }
+            await activeTorchTrack.applyConstraints({ advanced: [{ torch: true }] });
+            return JSON.stringify({ success: true, state: "on" });
+          } else {
+            if (activeTorchTrack) {
+              await activeTorchTrack.applyConstraints({ advanced: [{ torch: false }] });
+              activeTorchTrack.stop();
+              activeTorchTrack = null;
+            }
+            return JSON.stringify({ success: true, state: "off" });
+          }
+        } else if (name === "set_offline_alarm") {
+          const secs = parseInt(args.seconds, 10) || 10;
+          setTimeout(() => playChime(587, 1000), secs * 1000);
+          return JSON.stringify({ success: true, message: `Alarm set for ${secs}s.` });
+        }
+        return JSON.stringify({ error: "Unknown tool" });
+      } catch (err) {
+        return JSON.stringify({ error: err.message });
+      }
+    }
+
+    async function initStack() {
+      if (!navigator.gpu) {
+        statusEl.textContent = "WebGPU Missing";
+        statusEl.className = "status-badge error";
+        return;
+      }
+      loadBtn.disabled = true;
+      modelSelect.disabled = true;
+
+      try {
+        statusEl.textContent = "Loading Keyword Spotter...";
+        kwsClassifier = await pipeline("audio-classification", "Xenova/wav2vec2-base-superb-ks", { quantized: true });
+
+        statusEl.textContent = "Loading Whisper STT...";
+        sttPipeline = await pipeline("automatic-speech-recognition", "onnx-community/whisper-tiny.en", {
+          device: "webgpu",
+          dtype: { encoder_model: "fp32", decoder_model_merged: "q4" }
+        });
+
+        statusEl.textContent = "Loading Silero VAD...";
+        myvad = await window.vad.MicVAD.new({
+          positiveSpeechThreshold: 0.65,
+          negativeSpeechThreshold: 0.40,
+          redemptionFrames: 16,
+          preSpeechPadFrames: 8,
+          minSpeechFrames: 4,
+          onSpeechEnd: async (pcm) => await handleUtterance(pcm)
+        });
+
+        statusEl.textContent = "Loading LLM...";
+        llmEngine = await CreateMLCEngine(modelSelect.value, {
+          initProgressCallback: (r) => statusEl.textContent = `LLM: ${Math.round((r.progress || 0) * 100)}%`,
+          appConfig: { useIndexedDBCache: true }
+        });
+
+        wakeToggleBtn.disabled = false;
+        userInput.disabled = false;
+        sendBtn.disabled = false;
+        loadBtn.textContent = "Reload";
+        loadBtn.disabled = false;
+        modelSelect.disabled = false;
+        setUI("OFF", "Ready");
+        appendMessage("system", "Stack initialized successfully.");
+      } catch (err) {
+        statusEl.textContent = "Init Error";
+        statusEl.className = "status-badge error";
+        appendMessage("system", `Error: ${err.message}`);
+        loadBtn.disabled = false;
+        modelSelect.disabled = false;
+      }
+    }
+
+    async function handleUtterance(pcm) {
+      if (pipelineState === "STANDBY") {
+        const clip = pcm.length > 20000 ? pcm.subarray(0, 20000) : pcm;
+        const preds = await kwsClassifier(clip, { top_k: 3 });
+        const target = wakewordSelect.value.toLowerCase();
+        const match = preds.find(p => p.label.toLowerCase() === target && p.score >= 0.82);
+
+        if (match) {
+          playChime(880, 140);
+          setUI("AWAKE_LISTENING", "Wake Word Verified!");
+          clearTimeout(commandTimeoutId);
+          commandTimeoutId = setTimeout(() => {
+            if (pipelineState === "AWAKE_LISTENING") {
+              playChime(440, 110);
+              setUI("STANDBY", "Timeout -> Standby");
+            }
+          }, 8000);
+        }
+      } else if (pipelineState === "AWAKE_LISTENING") {
+        clearTimeout(commandTimeoutId);
+        setUI("PROCESSING", "Transcribing...");
+        try {
+          const res = await sttPipeline(pcm, { chunk_length_s: 30, stride_length_s: 5, return_timestamps: false });
+          const text = (res.text || "").trim();
+          if (text && !/^(\[.*\]|\(.*\))$/.test(text)) {
+            await runLLM(text);
+          }
+        } catch (err) {
+          appendMessage("system", `STT Error: ${err.message}`);
+        } finally {
+          if (pipelineState !== "OFF") setUI("STANDBY");
+        }
+      }
+    }
+
+    async function runLLM(prompt) {
+      if (!prompt || !llmEngine) return;
+      setUI("PROCESSING", "Thinking...");
+      window.speechSynthesis?.cancel();
+
+      appendMessage("user", prompt);
+      conversationHistory.push({ role: "user", content: prompt });
+
+      const botMsg = appendMessage("assistant", "...");
+      let fullReply = "";
+      let sentenceBuf = "";
+
+      try {
+        const chunks = await llmEngine.chat.completions.create({
+          messages: conversationHistory,
+          temperature: 0.6,
+          max_tokens: 200,
+          stream: true
+        });
+
+        for await (const chunk of chunks) {
+          const delta = chunk.choices[0]?.delta?.content || "";
+          fullReply += delta;
+          sentenceBuf += delta;
+          botMsg.textContent = fullReply;
+          chatContainer.scrollTop = chatContainer.scrollHeight;
+
+          const jsonMatch = fullReply.match(/\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{.*?\})\s*\}/s);
+          if (jsonMatch) {
+            const toolName = jsonMatch[1];
+            let toolArgs = {};
+            try { toolArgs = JSON.parse(jsonMatch[2]); } catch (_) {}
+            
+            botMsg.textContent = `[Executing tool: ${toolName}...]`;
+            const observation = await executeTool(toolName, toolArgs);
+            
+            conversationHistory.push({ role: "assistant", content: fullReply });
+            conversationHistory.push({ role: "system", content: `Tool Observation: ${observation}` });
+            return await runLLM("Summarize the tool result to the user.");
+          }
+
+          const match = sentenceBuf.match(/^(.*?[.!?]\s+)(.*)$/s);
+          if (match) {
+            speak(match[1]);
+            sentenceBuf = match[2];
+          }
+        }
+
+        if (sentenceBuf.trim()) speak(sentenceBuf);
+        conversationHistory.push({ role: "assistant", content: fullReply });
+      } catch (err) {
+        botMsg.textContent = `[Error: ${err.message}]`;
+      }
+    }
+
+    loadBtn.addEventListener("click", initStack);
+    wakeToggleBtn.addEventListener("click", async () => {
+      if (!myvad) return;
+      if (pipelineState === "OFF") {
+        await myvad.start();
+        setUI("STANDBY");
+      } else {
+        clearTimeout(commandTimeoutId);
+        await myvad.pause();
+        setUI("OFF");
+      }
+    });
+    sendBtn.addEventListener("click", async () => {
+      const text = userInput.value.trim();
+      if (text && pipelineState !== "PROCESSING") {
+        userInput.value = "";
+        const prev = pipelineState;
+        await runLLM(text);
+        setUI(prev === "OFF" ? "OFF" : "STANDBY");
+      }
+    });
+    userInput.addEventListener("keydown", (e) => { if (e.key === "Enter") sendBtn.click(); });
+  </script>
+</body>
+</html>
+
